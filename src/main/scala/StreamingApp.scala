@@ -1,67 +1,96 @@
-import org.apache.spark.{SparkConf, SparkContext}
-import org.apache.spark.sql.{Row, SparkSession}
 
-import scala.collection.mutable.ListBuffer
+import org.apache.spark.sql.SparkSession
 import java.time.LocalDate
 import java.time.temporal.ChronoUnit
 
 import org.joda.time.format.DateTimeFormat
 import java.util.Locale
 
-import org.apache.spark
+import org.apache.spark.rdd.RDD
+import org.apache.spark.ml.classification.MultilayerPerceptronClassifier
+import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator
+import org.apache.spark.ml.feature.{LabeledPoint, StandardScaler}
+import org.apache.spark.ml.linalg.Vectors
+
+
 
 object StreamingApp extends App {
 
-  val conf = new SparkConf().setAppName("AppName").setMaster("local[*]")
+//Todo = This Does not work atm!! change features so that categories are doubles. This may be a change in data collection and not this app.
 
-  val context = new SparkContext(conf)
+  val session = SparkSession.builder().appName("ANNDemo")
+    .master("local[*]")
+    .getOrCreate()
 
-  val raceRddFromFile = context.textFile("/Users/andydowell/dashboard_for_horses/appoires/horse_and_race/*")
+  val lines: RDD[String] = session.sparkContext.textFile("/Users/andydowell/dashboard_for_horses/appoires/horse_and_race/2K_clean_race_and_horse_data_with_age_and_pos_maps.csv")
 
-  val rdd = raceRddFromFile.map(f=>{
-    f.split(",")
-  })
-
-  val courses = new ListBuffer[String]
-// ID,NAME,DOB,TRAINER,GENDER,SIRE,DAM,OWNER,DATE,POS,RAN,BHA,TYPE,
-// COURSE,DISTANCE,GOING,CLASS,STARTING PRICE
-  val mappedRaced = rdd.filter(
-                              row => {
-                                  !row(2).toString.trim.equals("DOB") &&
-                                  !row(10).toString.trim.equals("-") &&
-                                  !row(11).toString.trim.equals("-") &&
-                                  !row(12).toString.trim.equals("-") &&
-                                  !row(16).toString.trim.equals("-") &&
-                                  convertDobToMonths(row(2)) != 0L //&&
-                                 //  row(13).toString.trim.toLowerCase.equals("bath")
-                              }).map(
-                                row => (condition(row(9).toString.trim),
-                                        (row(0), row(1),  convertDobToMonths(row(2)),row(3), row(4), row(7), row(8), row(10),row(11),row(12),row(13),row(14),row(15),row(16),row(17) )
-                                        )
-                                ).collect()
-
-  mappedRaced.foreach(
-    row => {
-      val course = row._2._11.trim.toUpperCase()
-      if(!courses.contains(course)) {
-        courses.append(course)
-      }
-    }
+  val filtered: RDD[String] = lines.filter(
+      row => !row.split(",")(2).toString.trim.equals("DOB") &&
+      !row.split(",")(9).toString.trim.equals("-") &&
+      !row.split(",")(10).toString.trim.equals("-") &&
+      !row.split(",")(11).toString.trim.equals("-") &&
+      !row.split(",")(12).toString.trim.equals("-") &&
+     !row.split(",")(16).toString.trim.equals("-") &&
+     convertDobToMonths(row.split(",")(2).toString) != 0L
   )
 
- // mappedRaced.foreach(println)
+  filtered.foreach(println)
 
-  println("size =======> " + mappedRaced.length)
+  import session.implicits._
 
-  def condition(pos:String): String ={
+  val rdd = filtered.map(parseLine).toDS()
 
-    if(pos.equals("1") || pos.equals("1") || pos.equals("3")){
-      "W"
-    }else{
-      "L"
-    }
+//ID	NAME	DOB	AGE OF HORSE	TRAINER	GENDER	SIRE	DAM	OWNER	DATE	POS	RAN	BHA	TYPE	COURSE	DISTANCE	GOING	CLASS	STARTING PRICE	POS_LABEL
 
+
+  def parseValues(value : String) : Double =
+  { value match {
+    case "Male" | "France" => 0.0
+    case "Female" | "Spain" => 1.0
+    case "Germany" => 2.0
+    case default => value.toDouble }
   }
+
+  def parseLine(line : String) = {
+    println("=========> " + line)
+    var fields = line.split(",")
+
+    var vector = fields.map(parseValues)
+    LabeledPoint(parseValues(fields(13)), Vectors.dense(vector))
+  }
+
+  val scaler = new StandardScaler().setInputCol("features")
+    .setOutputCol("scaledFeatures")
+    .setWithMean(true)
+    .setWithStd(true)
+
+  val scalerModel = scaler.fit(rdd)
+
+  val data = scalerModel.transform(rdd)
+
+  val splits = data.randomSplit(Array(0.75, 0.25), seed = 1234L)
+  val train = splits(0)
+  val test = splits(1)
+
+
+  val layers = Array[Int](9, 5, 5, 5, 5, 5, 2)
+  val trainer = new MultilayerPerceptronClassifier()
+    .setLayers(layers)
+    .setBlockSize(128)
+    .setSeed(1234L)
+    .setMaxIter(100)
+
+  // train the model
+  val model = trainer.fit(train)
+
+  // compute accuracy on the test set
+
+  val result = model.transform(test)
+  val predictionAndLabels = result.select("prediction", "label")
+  val evaluator = new MulticlassClassificationEvaluator() .setMetricName("accuracy")
+
+
+  println("Test set accuracy = " + evaluator.evaluate(predictionAndLabels))
 
   def convertDobToMonths(birthDate:String): Long={
 
